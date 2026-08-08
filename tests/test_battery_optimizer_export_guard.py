@@ -3675,3 +3675,62 @@ def test_priority_export_bridge_nets_import_bonus_hd7(battery_optimizer_module):
         import_bonus_prices=[0.0, 0.0, 0.08, 0.0, 0.0, 0.0],
     )
     assert bonus_floors is None
+
+
+def test_flow_power_sunny_day_grid_charges_only_shortfall_in_cheap_slots(
+    battery_optimizer_module,
+):
+    """Sunny-day Flow Power: the LP fills the pre-window shortfall only.
+
+    This models the coordinator's auto-armed pre-window floor for Flow Power
+    Happy Hour (battery full by 17:30).  With a strong solar afternoon, grid
+    must charge just the shortfall left after the 0.80 solar credit, spread
+    across the cheap pre-window slots instead of the expensive afternoon.
+    """
+    if not battery_optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=13500,
+        max_charge_w=5000,
+        max_discharge_w=5000,
+        efficiency=1.0,
+        backup_reserve=0.05,
+        interval_minutes=60,
+        horizon_hours=10,
+        terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = 9  # 17:30 in a 08:30-start horizon
+    optimizer.pre_window_soc_target = 1.0
+    optimizer.pre_window_solar_credit_factor = 0.80
+    optimizer.pre_window_solar_buffer_soc = 0.03
+
+    n = 10
+    import_prices = [0.05] * 4 + [0.30] * 6
+    export_prices = [0.0] * 9 + [0.50]
+    solar_forecast = [0.0, 0.0, 0.0, 0.0, 3.0, 3.0, 2.0, 0.0, 0.0, 0.0]
+    load_forecast = [0.0] * n
+
+    result = optimizer.optimize(
+        import_prices=import_prices,
+        export_prices=export_prices,
+        solar_forecast=solar_forecast,
+        load_forecast=load_forecast,
+        current_soc=0.20,
+        acquisition_cost_kwh=0.0,
+        allow_battery_export=[False] * 9 + [True],
+        allow_grid_charge=True,
+    )
+
+    assert result.feasible is True
+
+    grid_kwh = sum(result.grid_import_w) / 1000
+    # Shortfall only: the 0.80 solar credit leaves a ~2-5 kWh grid need, far
+    # below the 10.8 kWh needed for a fully grid-sourced fill.
+    assert 2.0 < grid_kwh < 6.5
+    # Grid never fires in the expensive 0.30 afternoon slots.
+    assert max(result.grid_import_w[4:]) <= 1e-6
+    # Battery is full before the Happy Hour export window opens.
+    assert result.schedule.actions[8].soc >= 0.995
+    # The solar-only fill is not exported before the window opens.
+    assert max(action.battery_discharge_w for action in result.schedule.actions[:9]) <= 1e-6

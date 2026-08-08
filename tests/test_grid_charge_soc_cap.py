@@ -37,7 +37,9 @@ _STUB_MODULE_NAMES = (
     "homeassistant.util",
     "homeassistant.util.dt",
     "power_sync",
+    "power_sync.automations",
     "power_sync.const",
+    "power_sync.coordinator",
     "power_sync.optimization",
     "power_sync.optimization.battery_optimizer",
     "power_sync.optimization.coordinator",
@@ -77,6 +79,7 @@ def _install_ha_stubs() -> None:
 
     ha_core.HomeAssistant = type("HomeAssistant", (), {})
     ha_exceptions.ConfigEntryNotReady = type("ConfigEntryNotReady", (Exception,), {})
+    ha_exceptions.ConfigEntryAuthFailed = type("ConfigEntryAuthFailed", (Exception,), {})
     ha_storage.Store = _Store
     ha_update.DataUpdateCoordinator = _DataUpdateCoordinator
     ha_dispatcher.async_dispatcher_send = lambda *args, **kwargs: None
@@ -114,6 +117,16 @@ def _install_power_sync_stubs() -> None:
     optimization_module = types.ModuleType("power_sync.optimization")
     optimization_module.__path__ = [str(COMPONENT_ROOT / "optimization")]
     sys.modules["power_sync.optimization"] = optimization_module
+
+    coordinator_module = types.ModuleType("power_sync.coordinator")
+    coordinator_module.normalize_custom_power_kw = (
+        lambda value, unit="": float(value) if value is not None else None
+    )
+    sys.modules["power_sync.coordinator"] = coordinator_module
+
+    automations_module = types.ModuleType("power_sync.automations")
+    automations_module.__path__ = []
+    sys.modules["power_sync.automations"] = automations_module
 
     const_module = types.ModuleType("power_sync.const")
     const_module.DOMAIN = "power_sync"

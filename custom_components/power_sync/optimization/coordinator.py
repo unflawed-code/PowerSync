@@ -5276,19 +5276,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 self._optimizer.suppress_reserve_warning = False
 
-            # Pre-window SOC floor: in Charge By Time mode, force the battery
-            # to reach the configured SOC by the configured target time.
-            _target_slot = (
-                self._next_charge_by_time_target_slot()
-                if self._config.allow_grid_charge
-                else None
-            )
+            # Pre-window SOC floor: force the battery to reach the target SOC
+            # by the target time.  Charge By Time configures the deadline
+            # explicitly; Flow Power auto-arms the same floor at the Happy
+            # Hour start so the battery is full before the premium export
+            # window opens — the LP then spreads the grid charge across the
+            # cheapest pre-window slots, leaving room for forecast solar.
+            _target_slot, _target_soc = self._pre_window_fill_target()
             self._optimizer.pre_window_slot = _target_slot
-            self._optimizer.pre_window_soc_target = (
-                self._charge_by_time_target_soc()
-                if self._optimizer.pre_window_slot is not None
-                else 0.0
-            )
+            self._optimizer.pre_window_soc_target = _target_soc
             forecast_source = getattr(
                 self._solar_forecaster, "last_forecast_source", None
             )
@@ -9954,19 +9950,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return [False] * n
         return self._flow_power_export_window_slots(n)
 
-    def _flow_power_export_window_slots(self, n: int) -> list[bool]:
-        """Return Flow Power's configured daily export window slots."""
-        if self._provider_key() != "flow_power":
-            return [False] * n
+    def _flow_power_happy_hour_rate(self) -> float:
+        """Return the configured Flow Power Happy Hour export rate, or 0.0."""
         if not self._entry:
-            return [False] * n
+            return 0.0
 
         from ..const import (
             CONF_FLOW_POWER_EXPORT_RATE,
-            CONF_FLOW_POWER_HAPPY_HOUR_END,
             CONF_FLOW_POWER_STATE,
             FLOW_POWER_EXPORT_RATES,
-            resolve_flow_power_happy_hour_end,
         )
 
         state = self._entry.options.get(
@@ -9978,15 +9970,25 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._entry.data.get(CONF_FLOW_POWER_EXPORT_RATE),
         )
         try:
-            happy_rate = (
-                float(configured_rate) / 100
-                if configured_rate not in (None, "")
-                else FLOW_POWER_EXPORT_RATES.get(state, 0.0)
-            )
+            if configured_rate not in (None, ""):
+                return float(configured_rate) / 100
+            return FLOW_POWER_EXPORT_RATES.get(state, 0.0)
         except (ValueError, TypeError):
-            happy_rate = FLOW_POWER_EXPORT_RATES.get(state, 0.0)
+            return FLOW_POWER_EXPORT_RATES.get(state, 0.0)
 
-        if happy_rate <= 0:
+    def _flow_power_export_window_slots(self, n: int) -> list[bool]:
+        """Return Flow Power's configured daily export window slots."""
+        if self._provider_key() != "flow_power":
+            return [False] * n
+        if not self._entry:
+            return [False] * n
+
+        from ..const import (
+            CONF_FLOW_POWER_HAPPY_HOUR_END,
+            resolve_flow_power_happy_hour_end,
+        )
+
+        if self._flow_power_happy_hour_rate() <= 0:
             return [False] * n
 
         happy_hour_end = resolve_flow_power_happy_hour_end(
@@ -10395,6 +10397,26 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return result
 
+    def _pre_window_fill_target(self) -> tuple[int | None, float]:
+        """Return (deadline slot, target SOC) for the pre-window fill floor.
+
+        Charge By Time configures the deadline explicitly; Flow Power
+        auto-arms the same floor at the Happy Hour start so the battery is
+        full before the premium export window opens.  Charge By Time takes
+        priority when both are configured.
+        """
+        if not self._config.allow_grid_charge:
+            return None, 0.0
+        _target_slot = self._next_charge_by_time_target_slot()
+        if _target_slot is not None:
+            return _target_slot, self._charge_by_time_target_soc()
+        _flow_power_slot = self._next_flow_power_happy_hour_slot()
+        if _flow_power_slot is not None:
+            return _flow_power_slot, self._soc_ratio(
+                self._config.grid_charge_soc_cap, 1.0
+            )
+        return None, 0.0
+
     def _next_charge_by_time_target_slot(self) -> int | None:
         """Slot index of the next Charge By Time SOC target in the LP horizon."""
         if not self._config.charge_by_time_enabled:
@@ -10442,6 +10464,44 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if slot_min == target_slot_min:
                 # Skip t=0: the target is now, so there are no pre-window slots
                 # to charge in. The next matching target will be tomorrow.
+                if t == 0:
+                    continue
+                return t
+        return None
+
+    def _next_flow_power_happy_hour_slot(self) -> int | None:
+        """Slot index of the next Flow Power Happy Hour start in the LP horizon.
+
+        Flow Power pays a premium feed-in rate during Happy Hour (17:30 until
+        the configured end).  Filling the battery ahead of that window is
+        economically motivated even without a Charge By Time target, so the
+        coordinator arms the same pre-window SOC floor automatically.  This
+        returns the slot index whose local time matches the Happy Hour start.
+        """
+        if not self._config.allow_grid_charge:
+            return None
+        if self._provider_key() != "flow_power":
+            return None
+        if self._flow_power_happy_hour_rate() <= 0:
+            return None
+
+        from ..const import FLOW_POWER_HAPPY_HOUR_START
+
+        target_min = _hhmm_to_minutes(FLOW_POWER_HAPPY_HOUR_START, "17:30")
+        interval = self._config.interval_minutes
+        target_slot_min = (target_min // interval) * interval
+        n_steps = int(self._config.horizon_hours * 60) // interval
+        raw_now = dt_util.now()
+        now = raw_now.replace(
+            minute=(raw_now.minute // interval) * interval,
+            second=0, microsecond=0,
+        )
+        for t in range(n_steps):
+            slot = now + timedelta(minutes=t * interval)
+            slot_min = slot.hour * 60 + slot.minute
+            if slot_min == target_slot_min:
+                # Skip t=0: the window opens now, so there are no pre-window
+                # slots to charge in. The next matching window is tomorrow.
                 if t == 0:
                     continue
                 return t
