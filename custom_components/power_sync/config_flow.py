@@ -10642,6 +10642,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         battery_system = self._effective_battery_system()
         is_tesla = battery_system == BATTERY_SYSTEM_TESLA
         is_custom = battery_system == BATTERY_SYSTEM_CUSTOM
+        is_flow_power = self._electricity_provider() == "flow_power"
         is_sungrow_ihomemanager = (
             battery_system == BATTERY_SYSTEM_SUNGROW
             and self._get_option(
@@ -11345,6 +11346,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 bool(current_profit_max_enabled),
             ),
         )
+        if is_flow_power:
+            current_charge_by_time_enabled = False
         current_charge_by_time_target_time = self._get_option(
             CONF_CHARGE_BY_TIME_TARGET_TIME,
             self.config_entry.data.get(
@@ -11650,23 +11653,28 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     unit_of_measurement=self._selector_unit("daily"),
                     mode=NumberSelectorMode.BOX,
                 )),
-                vol.Required(
-                    CONF_CHARGE_BY_TIME_ENABLED,
-                    default=bool(current_charge_by_time_enabled),
-                ): BooleanSelector(),
-                vol.Required(
-                    CONF_CHARGE_BY_TIME_TARGET_TIME,
-                    default=current_charge_by_time_target_time,
-                ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-                vol.Required(
-                    CONF_CHARGE_BY_TIME_TARGET_SOC,
-                    default=current_charge_by_time_target_soc,
-                ): NumberSelector(NumberSelectorConfig(
-                    min=0, max=100, step=1, unit_of_measurement="%",
-                    mode=NumberSelectorMode.SLIDER,
-                )),
             }
         )
+        if not is_flow_power:
+            schema_fields.update(
+                {
+                    vol.Required(
+                        CONF_CHARGE_BY_TIME_ENABLED,
+                        default=bool(current_charge_by_time_enabled),
+                    ): BooleanSelector(),
+                    vol.Required(
+                        CONF_CHARGE_BY_TIME_TARGET_TIME,
+                        default=current_charge_by_time_target_time,
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                    vol.Required(
+                        CONF_CHARGE_BY_TIME_TARGET_SOC,
+                        default=current_charge_by_time_target_soc,
+                    ): NumberSelector(NumberSelectorConfig(
+                        min=0, max=100, step=1, unit_of_measurement="%",
+                        mode=NumberSelectorMode.SLIDER,
+                    )),
+                }
+            )
 
         section_fields = {
             "core_goals": {

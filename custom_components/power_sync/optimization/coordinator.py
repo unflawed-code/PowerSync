@@ -1053,6 +1053,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def charge_by_time_enabled(self) -> bool:
         """Return whether charge-by-time prefill is active."""
+        if self._provider_key() == "flow_power":
+            return False
         return self._config.charge_by_time_enabled
 
     @property
@@ -1254,6 +1256,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> bool:
         """Enable or disable charge-by-time prefill mode."""
         enabled = bool(enabled)
+        if self._provider_key() == "flow_power":
+            enabled = False
         if self._config.charge_by_time_enabled == enabled:
             return False
         self._config.charge_by_time_enabled = enabled
@@ -4003,6 +4007,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     bool(profit_max),
                 ),
             )
+            if self._provider_key() == "flow_power":
+                charge_by_time = False
             self._config.charge_by_time_enabled = bool(charge_by_time)
             self._config.charge_by_time_target_time = str(
                 self._entry.options.get(
@@ -10420,6 +10426,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _next_charge_by_time_target_slot(self) -> int | None:
         """Slot index of the next Charge By Time SOC target in the LP horizon."""
         if not self._config.charge_by_time_enabled:
+            return None
+        if self._provider_key() == "flow_power":
             return None
 
         from ..const import (

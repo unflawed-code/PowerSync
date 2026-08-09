@@ -298,14 +298,28 @@ def test_flow_power_pre_window_fill_uses_grid_charge_soc_cap(opt_module):
     assert target == 0.8
 
 
-def test_charge_by_time_takes_priority_over_flow_power(opt_module):
-    """A configured Charge By Time target wins over the Flow Power fallback."""
+def test_charge_by_time_ignored_for_flow_power(opt_module):
+    """Charge By Time is disabled for Flow Power; the Happy Hour floor applies."""
     coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
     coordinator._config.charge_by_time_enabled = True
     coordinator._config.charge_by_time_target_time = "17:15"
     slot, target = coordinator._pre_window_fill_target()
-    assert slot == 17
+    assert slot == 18
     assert target == 1.0
+
+
+def test_charge_by_time_enabled_forced_off_for_flow_power(opt_module):
+    """The charge_by_time_enabled property reports False for Flow Power."""
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    coordinator._config.charge_by_time_enabled = True
+    assert coordinator.charge_by_time_enabled is False
+
+
+def test_charge_by_time_enabled_honored_for_other_provider(opt_module):
+    """Other providers keep the configured charge-by-time state."""
+    coordinator = _coordinator(opt_module, provider="amber", flow_power_state="NSW1")
+    coordinator._config.charge_by_time_enabled = True
+    assert coordinator.charge_by_time_enabled is True
 
 
 def test_flow_power_pre_window_fill_none_without_grid_charge(opt_module):

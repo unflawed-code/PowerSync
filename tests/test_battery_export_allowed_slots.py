@@ -2980,7 +2980,7 @@ def test_charge_by_time_setting_change_schedules_background_reoptimization(
 ):
     coordinator = _coordinator(
         opt_module,
-        "flow_power",
+        "amber",
         charge_by_time=False,
         charge_by_time_target_time="17:15",
         charge_by_time_target_soc=1.0,
@@ -3018,7 +3018,7 @@ def test_charge_by_time_setting_change_schedules_background_reoptimization(
 def test_charge_by_time_switch_setter_publishes_when_optimizer_disabled(opt_module):
     coordinator = _coordinator(
         opt_module,
-        "flow_power",
+        "amber",
         charge_by_time=False,
     )
     _prepare_enabled_settings_coordinator(coordinator)
@@ -3039,7 +3039,7 @@ def test_charge_by_time_switch_setter_publishes_when_optimizer_disabled(opt_modu
 def test_combined_charge_by_time_settings_publish_one_final_snapshot(opt_module):
     coordinator = _coordinator(
         opt_module,
-        "flow_power",
+        "amber",
         charge_by_time=False,
         charge_by_time_target_time="17:15",
         charge_by_time_target_soc=1.0,
@@ -4050,7 +4050,7 @@ def test_profit_max_without_charge_by_time_does_not_set_prefill_target(opt_modul
     assert coordinator._profit_max_terminal_weight() == 0.3
 
 
-@pytest.mark.parametrize("provider", ["amber", "aemo_vpp", "globird", "octopus", "nz", "flow_power"])
+@pytest.mark.parametrize("provider", ["amber", "aemo_vpp", "globird", "octopus", "nz"])
 def test_charge_by_time_uses_default_target_for_all_providers(opt_module, provider):
     coordinator = _coordinator(
         opt_module,
@@ -4132,7 +4132,7 @@ def test_charge_by_time_uses_default_soc_target(opt_module):
 def test_charge_by_time_uses_configured_soc_target(opt_module):
     coordinator = _coordinator(
         opt_module,
-        "flow_power",
+        "octopus",
         charge_by_time=True,
         charge_by_time_target_soc=0.8,
     )
@@ -4152,10 +4152,10 @@ def test_charge_by_time_accepts_percent_soc_target(opt_module):
     assert coordinator._charge_by_time_target_soc() == 0.8
 
 
-def test_charge_by_time_accepts_target_after_flow_power_happy_hour_start(opt_module):
+def test_charge_by_time_accepts_target_after_1730(opt_module):
     coordinator = _coordinator(
         opt_module,
-        "flow_power",
+        "octopus",
         charge_by_time=True,
         charge_by_time_target_time="18:00",
     )

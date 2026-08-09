@@ -94,18 +94,21 @@ def optimizer_settings_schema() -> dict[str, Any]:
                 "owner": "optimizer",
                 "section": "core_goals",
                 "order": 12,
+                "visible_if": {"electricity_provider_not": "flow_power"},
             },
             "charge_by_time_target_soc": {
                 "category": "core",
                 "owner": "optimizer",
                 "section": "core_goals",
                 "order": 12,
+                "visible_if": {"electricity_provider_not": "flow_power"},
             },
             "charge_by_time_target_time": {
                 "category": "core",
                 "owner": "optimizer",
                 "section": "core_goals",
                 "order": 13,
+                "visible_if": {"electricity_provider_not": "flow_power"},
             },
             "backup_reserve": {
                 "category": "core",
