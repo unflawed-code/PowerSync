@@ -14,7 +14,7 @@ import importlib
 import sys
 import types
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -629,3 +629,142 @@ def test_flow_power_strict_export_no_window_is_noop(opt_module):
     )
     for action in result.actions:
         assert action.action == "idle"
+
+
+class _FakeTimer:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _FakeHass:
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[float, object, _FakeTimer]] = []
+
+    def async_call_later(self, delay, callback):
+        timer = _FakeTimer()
+        self.scheduled.append((delay, callback, timer))
+        return timer
+
+
+def _refresh_schedule(opt_module, n=48):
+    ScheduleAction = opt_module.ScheduleAction
+    OptimizationSchedule = opt_module.OptimizationSchedule
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    actions = []
+    for pos in range(n):
+        action = ScheduleAction()
+        action.timestamp = start + timedelta(minutes=30 * pos)
+        action.action = "idle"
+        action.power_w = 0.0
+        action.soc = 0.5
+        action.battery_charge_w = 0.0
+        action.battery_discharge_w = 0.0
+        actions.append(action)
+    schedule = OptimizationSchedule()
+    schedule.actions = actions
+    return schedule
+
+
+def _refresh_coordinator(opt_module, **options):
+    coordinator = _strict_coordinator(opt_module, **options)
+    coordinator._enabled = True
+    coordinator.hass = _FakeHass()
+    return coordinator
+
+
+def test_flow_power_export_refresh_scheduled_at_reserve_stop(opt_module):
+    """Export stopping at the reserve floor schedules a refresh for that time."""
+    coordinator = _refresh_coordinator(opt_module, flow_power_strict_export_window=True)
+    schedule = _refresh_schedule(opt_module)
+    # Window is 17:30-19:30 (slots 18-21). Export slots 18-19 then the
+    # battery reaches reserve, so slots 20-21 hold at self-consumption.
+    for pos in (18, 19):
+        schedule.actions[pos].action = "export"
+    for pos in (20, 21):
+        schedule.actions[pos].action = "self_consumption"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    assert len(coordinator.hass.scheduled) == 1
+    delay = coordinator.hass.scheduled[0][0]
+    assert delay == pytest.approx(10 * 3600)  # 08:30 -> 18:30
+    assert coordinator._fp_export_refresh_at == datetime(
+        2026, 5, 3, 18, 30, tzinfo=timezone.utc
+    )
+
+
+def test_flow_power_export_refresh_scheduled_at_window_end(opt_module):
+    """Export running to the end of Happy Hour schedules a refresh at 21:30."""
+    coordinator = _refresh_coordinator(
+        opt_module,
+        flow_power_strict_export_window=True,
+        flow_power_happy_hour_end="21:30",
+    )
+    schedule = _refresh_schedule(opt_module)
+    # Window is 17:30-21:30 (slots 18-25). Battery never reaches the floor,
+    # so every window slot exports until the window ends.
+    for pos in range(18, 26):
+        schedule.actions[pos].action = "export"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    assert len(coordinator.hass.scheduled) == 1
+    delay = coordinator.hass.scheduled[0][0]
+    assert delay == pytest.approx(13 * 3600)  # 08:30 -> 21:30
+    assert coordinator._fp_export_refresh_at == datetime(
+        2026, 5, 3, 21, 30, tzinfo=timezone.utc
+    )
+
+
+def test_flow_power_export_refresh_not_scheduled_when_strict_off(opt_module):
+    """No refresh timer when strict export is disabled."""
+    coordinator = _refresh_coordinator(opt_module)
+    schedule = _refresh_schedule(opt_module)
+    for pos in (18, 19):
+        schedule.actions[pos].action = "export"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    assert coordinator.hass.scheduled == []
+    assert getattr(coordinator, "_fp_export_refresh_at", None) is None
+
+
+def test_flow_power_export_refresh_not_scheduled_when_export_stopped(opt_module):
+    """No refresh timer when the schedule holds before any export happens."""
+    coordinator = _refresh_coordinator(opt_module, flow_power_strict_export_window=True)
+    schedule = _refresh_schedule(opt_module)
+    for pos in range(18, 22):
+        schedule.actions[pos].action = "self_consumption"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    assert coordinator.hass.scheduled == []
+
+
+def test_flow_power_export_refresh_reschedules_replacing_previous(opt_module):
+    """A later solve cancels the prior refresh timer and schedules a new one."""
+    coordinator = _refresh_coordinator(opt_module, flow_power_strict_export_window=True)
+    schedule = _refresh_schedule(opt_module)
+    for pos in (18, 19):
+        schedule.actions[pos].action = "export"
+    for pos in (20, 21):
+        schedule.actions[pos].action = "self_consumption"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    first_timer = coordinator.hass.scheduled[0][2]
+    for pos in range(18, 22):
+        schedule.actions[pos].action = "export"
+    coordinator._schedule_flow_power_export_refresh(schedule)
+    assert len(coordinator.hass.scheduled) == 2
+    assert first_timer.cancelled is True
+    delay = coordinator.hass.scheduled[1][0]
+    assert delay == pytest.approx(11 * 3600)  # 08:30 -> 19:30 window end
+
+
+def test_flow_power_export_refresh_fired_clears_timer(opt_module):
+    """The fired callback clears its references even when disabled."""
+    coordinator = _strict_coordinator(
+        opt_module, flow_power_strict_export_window=True
+    )
+    coordinator._enabled = False
+    coordinator._fp_export_refresh_timer = object()
+    coordinator._fp_export_refresh_at = datetime(
+        2026, 5, 3, 18, 30, tzinfo=timezone.utc
+    )
+    coordinator._flow_power_export_refresh_fired()
+    assert coordinator._fp_export_refresh_timer is None
+    assert coordinator._fp_export_refresh_at is None

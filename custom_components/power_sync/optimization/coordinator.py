@@ -388,6 +388,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Executor
         self._executor: ScheduleExecutor | None = None
 
+        # Flow Power strict export: one-shot timer that re-optimizes the
+        # moment the schedule stops exporting (reserve reached or the Happy
+        # Hour window ends), so the post-window plan is rebuilt with the
+        # battery where it really is.
+        self._fp_export_refresh_timer: Any | None = None
+        self._fp_export_refresh_at: datetime | None = None
+
         # EV Coordinator
         self._ev_coordinator: EVCoordinator | None = None
         self._ev_configs: list[EVConfig] = []
@@ -4908,6 +4915,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if price_reoptimize_task and not price_reoptimize_task.done():
             price_reoptimize_task.cancel()
             self._price_reoptimize_task = None
+        self._cancel_flow_power_export_refresh_timer()
 
         if self._price_listener_unsub:
             self._price_listener_unsub()
@@ -5951,6 +5959,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # right after the LP solve — don't wait for the next polling tick
             # (up to 5 minutes away).  The polling loop still re-applies the
             # action as a heartbeat, but this removes the initial delay.
+            self._schedule_flow_power_export_refresh(result.schedule)
             current_action = self._get_current_action()
             # Defensive re-check: disable() may have flipped _enabled to False
             # while this solve was awaiting forecast/battery-state I/O above
@@ -10119,6 +10128,101 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 CONF_FLOW_POWER_STRICT_EXPORT_WINDOW,
                 self._entry.data.get(CONF_FLOW_POWER_STRICT_EXPORT_WINDOW, False),
             )
+        )
+
+    def _cancel_flow_power_export_refresh_timer(self) -> None:
+        """Cancel a pending strict-export schedule refresh timer."""
+        timer = getattr(self, "_fp_export_refresh_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            self._fp_export_refresh_timer = None
+        self._fp_export_refresh_at = None
+
+    def _schedule_flow_power_export_refresh(
+        self, schedule: OptimizationSchedule
+    ) -> None:
+        """Re-optimize exactly when strict export stops exporting.
+
+        Strict export drains the battery to the reserve floor (or until the
+        Happy Hour window ends). The LP's post-window plan was built against
+        a different SOC trajectory, so it is stale the moment exporting stops.
+        Schedule a one-shot re-optimization for the wall-clock time the
+        committed schedule actually stops exporting so the remainder of the
+        horizon is recomputed from the battery's real state.  The periodic
+        polling loop still re-optimizes every interval as a safety net.
+        """
+        if not getattr(self, "_enabled", False):
+            return
+        if not self._flow_power_strict_export_enabled():
+            return
+        actions = list(getattr(schedule, "actions", None) or [])
+        if not actions:
+            return
+        window = self._flow_power_export_window_slots(len(actions))
+        interval = max(1, int(getattr(self._config, "interval_minutes", 5) or 5))
+        now = dt_util.now()
+
+        next_stop: datetime | None = None
+        pos = 0
+        while pos < len(actions):
+            if pos >= len(window) or not window[pos]:
+                pos += 1
+                continue
+            if getattr(actions[pos], "action", None) != "export":
+                pos += 1
+                continue
+            ts = getattr(actions[pos], "timestamp", None)
+            if ts is None:
+                pos += 1
+                continue
+            # Advance to the end of this contiguous export run: the schedule
+            # stops exporting when the run's last slot ends.
+            run_end = pos
+            while run_end + 1 < len(actions):
+                nxt = run_end + 1
+                if nxt >= len(window) or not window[nxt]:
+                    break
+                if getattr(actions[nxt], "action", None) != "export":
+                    break
+                run_end = nxt
+            end_ts = getattr(actions[run_end], "timestamp", None)
+            if end_ts is not None:
+                run_stop = end_ts + timedelta(minutes=interval)
+                if run_stop > now and (
+                    next_stop is None or run_stop < next_stop
+                ):
+                    next_stop = run_stop
+            pos = run_end + 1
+
+        if next_stop is None:
+            return
+
+        self._cancel_flow_power_export_refresh_timer()
+        self._fp_export_refresh_timer = self.hass.async_call_later(
+            max(1.0, (next_stop - now).total_seconds()),
+            self._flow_power_export_refresh_fired,
+        )
+        self._fp_export_refresh_at = next_stop
+        _LOGGER.info(
+            "Flow Power strict export: schedule refresh scheduled for %s "
+            "(when exporting stops)",
+            next_stop.isoformat(timespec="minutes"),
+        )
+
+    def _flow_power_export_refresh_fired(self, now: datetime | None = None) -> None:
+        """One-shot strict-export refresh callback: re-optimize with live SOC."""
+        self._fp_export_refresh_timer = None
+        self._fp_export_refresh_at = None
+        if not getattr(self, "_enabled", False):
+            return
+        self.hass.async_create_background_task(
+            self._run_optimization(
+                force=True, execution_trigger="flow_power_export_refresh"
+            ),
+            "powersync_flow_power_export_refresh",
         )
 
     def _apply_flow_power_strict_export(
