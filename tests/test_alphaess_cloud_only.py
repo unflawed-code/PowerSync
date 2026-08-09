@@ -13,7 +13,7 @@ API = ROOT / "custom_components" / "power_sync" / "alphaess_api.py"
 
 
 def _cloud_test_connection_method():
-    tree = ast.parse(API.read_text())
+    tree = ast.parse(API.read_text(encoding="utf-8"))
     cls = next(
         node
         for node in tree.body
@@ -32,7 +32,7 @@ def _cloud_test_connection_method():
 
 
 def test_cloud_only_coordinator_has_no_modbus_controller_or_dispatch():
-    source = COORDINATOR.read_text()
+    source = COORDINATOR.read_text(encoding="utf-8")
     alpha = source[
         source.index("class AlphaESSEnergyCoordinator"):
         source.index("def _normalize_alphaess_cloud_data")
@@ -45,9 +45,34 @@ def test_cloud_only_coordinator_has_no_modbus_controller_or_dispatch():
     assert alpha.count("if not self.supports_dispatch or self._controller is None:") == 5
 
 
+def test_alphaess_stale_returns_mark_telemetry_not_ready():
+    """Stale self.data fallbacks must flag telemetry_ready=False.
+
+    Without this the optimizer plans from a frozen battery SOC during a
+    Modbus/cloud outage (e.g. planning from 51% while the battery is really
+    at 77%), producing aggressive, wrong charge schedules. Sungrow already
+    marks staleness; AlphaESS must too. All three stale-return paths plus the
+    fresh path must be covered.
+    """
+    source = COORDINATOR.read_text(encoding="utf-8")
+    alpha = source[
+        source.index("class AlphaESSEnergyCoordinator"):
+        source.index("def _normalize_alphaess_cloud_data")
+    ]
+    update = alpha[
+        alpha.index("    async def _async_update_data"):
+        alpha.index("    async def set_backup_mode")
+    ]
+
+    # Every "keep previous readings" fallback must mark the copy stale.
+    assert update.count('stale_data["telemetry_ready"] = False') == 3
+    # The fresh data path explicitly reports ready telemetry.
+    assert '"telemetry_ready": True' in update
+
+
 def test_cloud_only_setup_requires_cloud_credentials_and_forces_monitoring():
-    flow = CONFIG_FLOW.read_text()
-    runtime = INIT.read_text()
+    flow = CONFIG_FLOW.read_text(encoding="utf-8")
+    runtime = INIT.read_text(encoding="utf-8")
 
     assert "ALPHAESS_CONNECTION_CLOUD_ONLY" in flow
     assert 'errors["base"] = "alphaess_cloud_required"' in flow

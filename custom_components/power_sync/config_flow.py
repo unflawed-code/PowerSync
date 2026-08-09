@@ -315,6 +315,7 @@ from .const import (
     CONF_FLOW_POWER_HAPPY_HOUR_END,
     CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
     CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+    CONF_FLOW_POWER_STRICT_EXPORT_WINDOW,
     CONF_PEA_CUSTOM_VALUE,
     FLOW_POWER_DEFAULT_BASE_RATE,
     FLOW_POWER_EXPORT_RATES,
@@ -14452,6 +14453,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 min=0.0, max=100.0, step=0.01, unit_of_measurement=self._selector_unit(),
                 mode=NumberSelectorMode.BOX,
             )),
+            vol.Optional(
+                CONF_FLOW_POWER_STRICT_EXPORT_WINDOW,
+                default=self._get_option(CONF_FLOW_POWER_STRICT_EXPORT_WINDOW, False),
+            ): BooleanSelector(),
             vol.Optional(
                 CONF_PEA_ENABLED,
                 default=self._get_option(CONF_PEA_ENABLED, True),

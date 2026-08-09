@@ -336,3 +336,296 @@ def test_flow_power_pre_window_fill_none_without_rate(opt_module):
 def test_flow_power_pre_window_fill_none_for_other_provider(opt_module):
     coordinator = _coordinator(opt_module, provider="agl", flow_power_state="NSW1")
     assert coordinator._pre_window_fill_target() == (None, 0.0)
+
+
+def _gate_coordinator(opt_module, **options):
+    coordinator = _coordinator(
+        opt_module, provider="flow_power", flow_power_state="NSW1", **options
+    )
+    coordinator._optimizer = SimpleNamespace(efficiency=0.9, max_charge_kw=5.0)
+    return coordinator
+
+
+def _happy_hour_export_prices(n, start=18, end=22):
+    prices = [0.0] * n
+    for t in range(start, end):
+        prices[t] = 0.40
+    return prices
+
+
+def test_flow_power_price_gate_disables_when_import_exceeds_export(opt_module):
+    """Buying at 42c to export at 40c is a loss — the fill must not force it."""
+    coordinator = _gate_coordinator(opt_module)
+    n = 48
+    gated = coordinator._price_gated_pre_window_target(
+        target_slot=18,
+        target_soc=1.0,
+        import_prices=[0.42] * n,
+        export_prices=_happy_hour_export_prices(n),
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.77,
+        capacity_wh=10000,
+    )
+    assert gated <= 0.77
+
+
+def test_flow_power_price_gate_keeps_profitable_fill(opt_module):
+    """Cheap 25c import below 40c export × round-trip efficiency still arms the fill."""
+    coordinator = _gate_coordinator(opt_module)
+    n = 48
+    gated = coordinator._price_gated_pre_window_target(
+        target_slot=18,
+        target_soc=1.0,
+        import_prices=[0.25] * n,
+        export_prices=_happy_hour_export_prices(n),
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.5,
+        capacity_wh=10000,
+    )
+    assert gated == 1.0
+
+
+def test_flow_power_price_gate_caps_to_cheap_slots_only(opt_module):
+    """Only slots at or below export × round-trip efficiency count toward the target."""
+    coordinator = _gate_coordinator(opt_module)
+    n = 48
+    import_prices = [0.42] * n
+    for t in range(0, 2):
+        import_prices[t] = 0.25
+    gated = coordinator._price_gated_pre_window_target(
+        target_slot=18,
+        target_soc=1.0,
+        import_prices=import_prices,
+        export_prices=_happy_hour_export_prices(n),
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.3,
+        capacity_wh=10000,
+    )
+    # 2 cheap slots × 2.5 kWh → +0.5 SOC → 0.8 reachable; 42c slots ignored.
+    assert gated == pytest.approx(0.8, abs=1e-6)
+
+
+def test_flow_power_price_gate_uses_free_solar_when_grid_unprofitable(opt_module):
+    """Solar surplus still counts toward the fill when grid charging is loss-making."""
+    coordinator = _gate_coordinator(opt_module)
+    n = 48
+    gated = coordinator._price_gated_pre_window_target(
+        target_slot=18,
+        target_soc=1.0,
+        import_prices=[0.42] * n,
+        export_prices=_happy_hour_export_prices(n),
+        solar_forecast=[6.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.5,
+        capacity_wh=10000,
+    )
+    assert gated == pytest.approx(1.0, abs=1e-6)
+
+
+def test_flow_power_price_gate_pass_through_without_optimizer(opt_module):
+    """Without an optimizer the gate leaves the configured target untouched."""
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    assert coordinator._optimizer is None
+    gated = coordinator._price_gated_pre_window_target(
+        target_slot=18,
+        target_soc=1.0,
+        import_prices=[0.42] * 48,
+        export_prices=_happy_hour_export_prices(48),
+        solar_forecast=[0.0] * 48,
+        load_forecast=[0.0] * 48,
+        current_soc=0.77,
+        capacity_wh=10000,
+    )
+    assert gated == 1.0
+
+
+def test_flow_power_cheap_charge_guide_discounts_midday(opt_module):
+    """Flow Power LP prices inside 10:00-14:00 get the 2c nudge."""
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    n = 48
+    guided = coordinator._flow_power_cheap_charge_guide([0.20] * n)
+    assert len(guided) == n
+    for idx in range(n):
+        expected = 0.18 if 3 <= idx <= 10 else 0.20
+        assert guided[idx] == pytest.approx(expected, abs=1e-9), idx
+
+
+def test_flow_power_cheap_charge_guide_leaves_other_providers_alone(opt_module):
+    """Non-Flow-Power providers see unchanged import prices."""
+    coordinator = _coordinator(opt_module, provider="agl", flow_power_state="NSW1")
+    prices = [0.20] * 48
+    guided = coordinator._flow_power_cheap_charge_guide(prices)
+    assert guided == prices
+    assert guided is not prices
+
+
+def test_flow_power_cheap_charge_guide_does_not_mutate_input(opt_module):
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    prices = [0.20] * 48
+    coordinator._flow_power_cheap_charge_guide(prices)
+    assert prices == [0.20] * 48
+
+
+def test_flow_power_cheap_charge_guide_empty_returns_copy(opt_module):
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    assert coordinator._flow_power_cheap_charge_guide([]) == []
+
+
+def test_flow_power_cheap_charge_guide_clamps_at_zero(opt_module):
+    """A price below the 2c guide cannot go negative inside the window."""
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    n = 48
+    prices = [0.01] * n
+    guided = coordinator._flow_power_cheap_charge_guide(prices)
+    for idx in range(n):
+        expected = 0.0 if 3 <= idx <= 10 else 0.01
+        assert guided[idx] == pytest.approx(expected, abs=1e-9), idx
+
+
+def test_flow_power_strict_export_enabled_default_off(opt_module):
+    coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
+    assert coordinator._flow_power_strict_export_enabled() is False
+
+
+def test_flow_power_strict_export_enabled_when_option_set(opt_module):
+    coordinator = _coordinator(
+        opt_module, provider="flow_power", flow_power_state="NSW1",
+        flow_power_strict_export_window=True,
+    )
+    assert coordinator._flow_power_strict_export_enabled() is True
+
+
+def test_flow_power_strict_export_enabled_ignored_for_other_provider(opt_module):
+    coordinator = _coordinator(
+        opt_module, provider="agl", flow_power_state="NSW1",
+        flow_power_strict_export_window=True,
+    )
+    assert coordinator._flow_power_strict_export_enabled() is False
+
+
+def _strict_schedule(opt_module, n=12, soc0=0.6):
+    ScheduleAction = opt_module.ScheduleAction
+    OptimizationSchedule = opt_module.OptimizationSchedule
+    actions = []
+    for pos in range(n):
+        action = ScheduleAction()
+        action.timestamp = f"t{pos}"
+        action.action = "idle"
+        action.power_w = 0.0
+        action.soc = soc0 if pos == 0 else 0.5
+        action.battery_charge_w = 0.0
+        action.battery_discharge_w = 0.0
+        actions.append(action)
+    schedule = OptimizationSchedule()
+    schedule.actions = actions
+    return schedule
+
+
+def _strict_coordinator(opt_module, **options):
+    coordinator = _coordinator(
+        opt_module, provider="flow_power", flow_power_state="NSW1", **options
+    )
+    coordinator._config.battery_capacity_wh = 10000
+    coordinator._config.max_discharge_w = 5000
+    coordinator._config.max_grid_export_w = None
+    coordinator._optimizer = SimpleNamespace(efficiency=0.9)
+    return coordinator
+
+
+def test_flow_power_strict_export_continuous_to_reserve(opt_module):
+    """Window slots export continuously until the reserve floor is reached."""
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=12, soc0=0.6)
+    window = [True] * 8 + [False] * 4
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        window,
+        reserve_floor=0.2,
+        solar_forecast=[0.0] * 12,
+        load_forecast=[0.0] * 12,
+    )
+    actions = result.actions
+    assert actions[0].action == "export"
+    assert actions[0].power_w == pytest.approx(5000)
+    assert actions[0].battery_discharge_w == pytest.approx(5000)
+    assert actions[0].soc == pytest.approx(0.3222, abs=1e-3)
+    assert actions[1].action == "export"
+    # Below floor from slot 2 onwards: hold at self-consumption.
+    for pos in range(2, 8):
+        assert actions[pos].action == "self_consumption", pos
+        assert actions[pos].power_w == 0.0
+        assert actions[pos].battery_discharge_w == 0.0
+        assert actions[pos].soc == pytest.approx(0.2, abs=1e-9)
+    # Outside the window the original plan is untouched.
+    assert actions[8].action == "idle"
+    assert actions[8].soc == 0.5
+
+
+def test_flow_power_strict_export_accounts_for_home_load(opt_module):
+    """Battery serves the home load first, exporting the leftover headroom."""
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=4, soc0=0.9)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [True] * 4,
+        reserve_floor=0.2,
+        solar_forecast=[0.5] * 4,
+        load_forecast=[2.0] * 4,
+    )
+    action = result.actions[0]
+    assert action.action == "export"
+    assert action.battery_discharge_w == pytest.approx(5000)
+    assert action.power_w == pytest.approx(3500)
+
+
+def test_flow_power_strict_export_respects_export_cap(opt_module):
+    """A configured export cap lowers the continuous export level."""
+    coordinator = _strict_coordinator(opt_module)
+    coordinator._config.max_grid_export_w = 3000
+    schedule = _strict_schedule(opt_module, n=4, soc0=0.9)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [True] * 4,
+        reserve_floor=0.2,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0] * 4,
+    )
+    action = result.actions[0]
+    assert action.action == "export"
+    assert action.power_w == pytest.approx(3000)
+    assert action.battery_discharge_w == pytest.approx(3000)
+
+
+def test_flow_power_strict_export_holds_when_below_reserve(opt_module):
+    """Starting below the reserve never manufactures an export."""
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=4, soc0=0.1)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [True] * 4,
+        reserve_floor=0.2,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0] * 4,
+    )
+    for action in result.actions[:4]:
+        assert action.action == "self_consumption"
+        assert action.power_w == 0.0
+        assert action.battery_discharge_w == 0.0
+        assert action.soc == pytest.approx(0.2, abs=1e-9)
+
+
+def test_flow_power_strict_export_no_window_is_noop(opt_module):
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=4, soc0=0.9)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [False] * 4,
+        reserve_floor=0.2,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0] * 4,
+    )
+    for action in result.actions:
+        assert action.action == "idle"

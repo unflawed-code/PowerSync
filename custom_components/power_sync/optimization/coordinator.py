@@ -128,6 +128,16 @@ GLOBIRD_QUOTA_EXPORT_RULE_ID = "globird_zerohero_bonus_export"
 GLOBIRD_QUOTA_IMPORT_RULE_ID = "globird_zerocharge_import"
 COST_NEUTRAL_OPTION = "cost_neutral_enabled"
 
+# Flow Power charging guide: wholesale/retail import is historically cheapest
+# between 10:00-14:00 (solar glut, typically around 12:00).  The guide shaves a
+# small fixed discount off the LP's *scheduling* import prices inside that
+# window so grid charging for the pre-window fill prefers midday first, while
+# the real forecast prices still dominate and other periods are used when the
+# cheap window cannot cover the energy need.
+FLOW_POWER_CHEAP_CHARGE_WINDOW_START = "10:00"
+FLOW_POWER_CHEAP_CHARGE_WINDOW_END = "14:00"
+FLOW_POWER_CHEAP_CHARGE_GUIDE_DISCOUNT = 0.02  # $/kWh (2c) LP-only nudge
+
 
 def sigenergy_capped_optimizer_limit_w(
     raw_limit_w: Any,
@@ -5289,6 +5299,36 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # window opens — the LP then spreads the grid charge across the
             # cheapest pre-window slots, leaving room for forecast solar.
             _target_slot, _target_soc = self._pre_window_fill_target()
+            if (
+                _target_slot is not None
+                and _target_soc > 0.0
+                and self._provider_key() == "flow_power"
+            ):
+                # The auto-armed fill is a hard LP constraint, so without a
+                # price gate the LP is forced to buy at a loss when the
+                # cheapest remaining import slot exceeds the Happy Hour
+                # export (e.g. importing at 42c to export at 40c). Cap the
+                # target at what is profitably reachable; disable it entirely
+                # when no profitable grid charging exists before the window.
+                _gated_soc = self._price_gated_pre_window_target(
+                    target_slot=_target_slot,
+                    target_soc=_target_soc,
+                    import_prices=import_prices,
+                    export_prices=export_prices,
+                    solar_forecast=solar_forecast,
+                    load_forecast=load_forecast,
+                    current_soc=soc,
+                    capacity_wh=capacity,
+                )
+                if _gated_soc <= soc + 1e-9:
+                    _LOGGER.info(
+                        "Flow Power pre-window fill disabled: no profitable "
+                        "grid charging before the Happy Hour (target %.1f%%)",
+                        _target_soc * 100,
+                    )
+                    _target_slot, _target_soc = None, 0.0
+                else:
+                    _target_soc = _gated_soc
             self._optimizer.pre_window_slot = _target_slot
             self._optimizer.pre_window_soc_target = _target_soc
             forecast_source = getattr(
@@ -5508,6 +5548,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else None
             )
 
+            # LP scheduling prices: the cheap-window guide shaves midday import
+            # slots for Flow Power so the pre-window fill prefers 10:00-14:00.
+            # Display, cost-neutral, and price-cap arrays keep real prices.
+            lp_import_prices = self._flow_power_cheap_charge_guide(import_prices)
+
             async def _run_optimizer_once(
                 reserve_floor: float | None = None,
                 export_reserve_floor: float | list[float] | None = None,
@@ -5517,7 +5562,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 try:
                     return await self.hass.async_add_executor_job(
                         self._optimizer.optimize,
-                        import_prices,
+                        lp_import_prices,
                         export_prices,
                         solar_forecast,
                         load_forecast,
@@ -5595,6 +5640,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._should_apply_offgrid_overlay():
                 schedule = self._apply_offgrid_overlay(
                     schedule, export_prices,
+                )
+            if self._flow_power_strict_export_enabled():
+                schedule = self._apply_flow_power_strict_export(
+                    schedule,
+                    self._flow_power_export_window_slots(len(export_prices)),
+                    reference_reserve_floor,
+                    solar_forecast,
+                    load_forecast,
                 )
             result = self._optimizer.reconcile_result_with_schedule(
                 result,
@@ -5682,6 +5735,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if self._should_apply_offgrid_overlay():
                     schedule = self._apply_offgrid_overlay(
                         schedule, export_prices,
+                    )
+                if self._flow_power_strict_export_enabled():
+                    schedule = self._apply_flow_power_strict_export(
+                        schedule,
+                        self._flow_power_export_window_slots(len(export_prices)),
+                        applied_reserve_floor,
+                        solar_forecast,
+                        load_forecast,
                     )
                 result = self._optimizer.reconcile_result_with_schedule(
                     result,
@@ -10005,6 +10066,223 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return self._time_window_slots(n, "17:30", happy_hour_end)
 
+    def _flow_power_cheap_charge_guide(
+        self, import_prices: list[float]
+    ) -> list[float]:
+        """Return LP scheduling import prices with a soft midday preference.
+
+        Flow Power's import price is historically cheapest between 10:00 and
+        14:00 (typically around 12:00).  This is a guide, not a hard rule: it
+        applies a small fixed discount to slots inside that window on the
+        prices handed to the LP solver, so grid charging for the pre-window
+        fill is steered to midday first.  The actual forecast prices still
+        dominate — a genuinely expensive midday keeps losing to cheap
+        overnight slots — and the returned array is used only by the LP
+        objective; display, cost-neutral, and price-cap arrays stay real.
+        """
+        if self._provider_key() != "flow_power" or not import_prices:
+            return list(import_prices)
+        cheap_slots = self._time_window_slots(
+            len(import_prices),
+            FLOW_POWER_CHEAP_CHARGE_WINDOW_START,
+            FLOW_POWER_CHEAP_CHARGE_WINDOW_END,
+        )
+        guided = list(import_prices)
+        guided_count = 0
+        for idx, in_window in enumerate(cheap_slots):
+            if not in_window or idx >= len(guided):
+                continue
+            try:
+                price = float(guided[idx] or 0.0)
+            except (TypeError, ValueError):
+                continue
+            guided[idx] = max(0.0, price - FLOW_POWER_CHEAP_CHARGE_GUIDE_DISCOUNT)
+            guided_count += 1
+        if guided_count:
+            _LOGGER.debug(
+                "Flow Power cheap-window charge guide: discounted %d "
+                "midday slots by %.2fc for the LP solve",
+                guided_count,
+                FLOW_POWER_CHEAP_CHARGE_GUIDE_DISCOUNT * 100,
+            )
+        return guided
+
+    def _flow_power_strict_export_enabled(self) -> bool:
+        """Return True when Flow Power should export straight to reserve."""
+        if not self._entry or self._provider_key() != "flow_power":
+            return False
+
+        from ..const import CONF_FLOW_POWER_STRICT_EXPORT_WINDOW
+
+        return bool(
+            self._entry.options.get(
+                CONF_FLOW_POWER_STRICT_EXPORT_WINDOW,
+                self._entry.data.get(CONF_FLOW_POWER_STRICT_EXPORT_WINDOW, False),
+            )
+        )
+
+    def _apply_flow_power_strict_export(
+        self,
+        schedule: OptimizationSchedule,
+        export_window_slots: list[bool],
+        reserve_floor: float,
+        solar_forecast: list[float],
+        load_forecast: list[float],
+    ) -> OptimizationSchedule:
+        """Override the Happy Hour window with continuous export-to-reserve.
+
+        When strict export is enabled the LP's finely-optimised in-window plan
+        (fragmented runs, tier balancing, profitability gates) is replaced:
+        every slot across the whole window exports continuously at the
+        achievable level (capped by the export limit plus any home load the
+        battery is serving) until the battery reaches the reserve floor, then
+        holds at self-consumption for the rest of the window.  This makes the
+        behaviour "start exporting at 17:30, stop once reserve is reached".
+        """
+        actions = list(schedule.actions or [])
+        if not actions:
+            return schedule
+
+        n = len(actions)
+        window = [bool(v) for v in export_window_slots[:n]]
+        if len(window) < n:
+            window.extend([False] * (n - len(window)))
+        if not any(window):
+            return schedule
+
+        interval_hours = max(1, int(self._config.interval_minutes or 5)) / 60.0
+        capacity_wh = max(0.0, float(self._config.battery_capacity_wh or 0))
+        efficiency = float(getattr(self._optimizer, "efficiency", 0.92) or 0.92)
+        discharge_cap_w = float(self._config.max_discharge_w or 0)
+        export_cap_w = float(
+            self._config.max_grid_export_w
+            if self._config.max_grid_export_w is not None
+            else self._config.max_discharge_w
+        )
+        reserve_floor = max(
+            0.0,
+            min(1.0, self._reserve_ratio(reserve_floor, 0.0) or 0.0),
+        )
+
+        new_actions: list[ScheduleAction] = list(actions)
+
+        def _slot_soc(pos: int) -> float | None:
+            if pos < 0 or pos >= len(new_actions):
+                return None
+            return self._reserve_ratio(
+                getattr(new_actions[pos], "soc", None), None
+            )
+
+        def _home_need_w(pos: int, original: ScheduleAction) -> float:
+            solar_kw = 0.0
+            load_kw = 0.0
+            if pos < len(solar_forecast) and solar_forecast:
+                try:
+                    solar_kw = max(0.0, float(solar_forecast[pos] or 0.0))
+                except (TypeError, ValueError):
+                    solar_kw = 0.0
+            if pos < len(load_forecast) and load_forecast:
+                try:
+                    load_kw = max(0.0, float(load_forecast[pos] or 0.0))
+                except (TypeError, ValueError):
+                    load_kw = 0.0
+            if solar_forecast and load_forecast:
+                return max(0.0, (load_kw - solar_kw) * 1000.0)
+            discharge_w = max(
+                0.0,
+                float(getattr(original, "battery_discharge_w", 0.0) or 0.0),
+            )
+            if getattr(original, "action", None) in SELF_USE_ACTIONS:
+                return discharge_w
+            if getattr(original, "action", None) in EXPORT_ACTIONS:
+                export_w = max(
+                    0.0,
+                    min(
+                        float(getattr(original, "power_w", 0.0) or 0.0),
+                        discharge_w,
+                    ),
+                )
+                return max(0.0, discharge_w - export_w)
+            return 0.0
+
+        def _advance_soc(soc: float, discharge_w: float) -> float:
+            if capacity_wh <= 0:
+                return soc
+            removed_wh = (
+                max(0.0, discharge_w)
+                * interval_hours
+                / max(efficiency, 0.001)
+            )
+            return max(0.0, min(1.0, soc - removed_wh / capacity_wh))
+
+        idx = 0
+        while idx < n:
+            if not window[idx]:
+                idx += 1
+                continue
+            start = idx
+            while idx < n and window[idx]:
+                idx += 1
+            end = idx
+
+            soc = _slot_soc(start - 1)
+            if soc is None:
+                soc = _slot_soc(start)
+            if soc is None:
+                soc = 0.0
+            soc = max(0.0, min(1.0, soc))
+
+            for pos in range(start, end):
+                original = actions[pos]
+                if soc <= reserve_floor + 1e-9:
+                    new_actions[pos].action = "self_consumption"
+                    new_actions[pos].power_w = 0.0
+                    new_actions[pos].battery_charge_w = 0.0
+                    new_actions[pos].battery_discharge_w = 0.0
+                    new_actions[pos].soc = round(reserve_floor, 4)
+                    continue
+
+                home_w = _home_need_w(pos, original)
+                available_for_export_w = max(0.0, discharge_cap_w - home_w)
+                discharge_w = min(
+                    discharge_cap_w,
+                    max(0.0, export_cap_w + home_w),
+                )
+                if discharge_w <= 0:
+                    new_actions[pos].action = "self_consumption"
+                    new_actions[pos].power_w = 0.0
+                    new_actions[pos].battery_charge_w = 0.0
+                    new_actions[pos].battery_discharge_w = 0.0
+                    new_actions[pos].soc = round(soc, 4)
+                    continue
+
+                export_w = max(
+                    0.0,
+                    min(export_cap_w, discharge_w - home_w),
+                )
+                new_actions[pos].battery_charge_w = 0.0
+                new_actions[pos].battery_discharge_w = round(discharge_w, 1)
+                if export_w > 0 and available_for_export_w > 0:
+                    new_actions[pos].action = "export"
+                    new_actions[pos].power_w = round(
+                        min(export_w, available_for_export_w),
+                        1,
+                    )
+                else:
+                    new_actions[pos].action = "self_consumption"
+                    new_actions[pos].power_w = 0.0
+                soc = _advance_soc(soc, discharge_w)
+                new_actions[pos].soc = round(soc, 4)
+
+        schedule.actions = new_actions
+        _LOGGER.debug(
+            "Flow Power strict export: continuous window(s) %s down to "
+            "reserve %.1f%%",
+            sum(1 for pos in range(n) if window[pos]),
+            reserve_floor * 100,
+        )
+        return schedule
+
     def _positive_price_export_slots(
         self,
         n: int,
@@ -10422,6 +10700,100 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._config.grid_charge_soc_cap, 1.0
             )
         return None, 0.0
+
+    def _price_gated_pre_window_target(
+        self,
+        target_slot: int | None,
+        target_soc: float,
+        import_prices: list[float],
+        export_prices: list[float],
+        solar_forecast: list[float],
+        load_forecast: list[float],
+        current_soc: float,
+        capacity_wh: float,
+    ) -> float:
+        """Cap the pre-window fill target at what is profitably reachable.
+
+        The Flow Power auto-armed fill is a hard LP constraint
+        (soc[deadline] >= target) with no price condition. When the cheapest
+        remaining import slot costs more than the Happy Hour export pays
+        after round-trip losses, the LP would be forced to buy at a loss —
+        e.g. importing at 42c to export at 40c. This forward simulation caps
+        the target at the SOC reachable using only grid slots priced at or
+        below the reference export × round-trip efficiency (plus free solar
+        surplus), so the fill never forces loss-making charging.
+
+        Returns the gated target (0-1). A value at or below current_soc means
+        no profitable fill exists — callers should disable the floor entirely.
+        """
+        dt_hours = max(0.0, self._config.interval_minutes / 60.0)
+        if (
+            target_slot is None
+            or target_soc <= 0.0
+            or capacity_wh <= 0
+            or dt_hours <= 0
+            or not self._optimizer
+        ):
+            return target_soc
+        efficiency = getattr(self._optimizer, "efficiency", 1.0) or 1.0
+        round_trip_eff = max(0.0, min(1.0, float(efficiency))) ** 2
+        max_charge_kw = getattr(self._optimizer, "max_charge_kw", 5.0) or 5.0
+        capacity_kwh = capacity_wh / 1000.0
+
+        n = min(
+            len(import_prices),
+            len(export_prices),
+            len(solar_forecast),
+            len(load_forecast),
+        )
+        # Reference export: the best price earned inside the target window.
+        ref_export = 0.0
+        for idx in range(target_slot, n):
+            try:
+                price = float(export_prices[idx] or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price > ref_export:
+                ref_export = price
+        if ref_export <= 0.0:
+            # No visible export reference — fall back to the configured target.
+            return target_soc
+        profitable_import = ref_export * round_trip_eff
+
+        soc = max(0.0, min(1.0, current_soc))
+        for t in range(min(target_slot, n)):
+            try:
+                import_price = float(import_prices[t] or 0.0)
+                solar_kw = max(0.0, float(solar_forecast[t] or 0.0))
+                load_kw = max(0.0, float(load_forecast[t] or 0.0))
+            except (TypeError, ValueError):
+                continue
+            room_kwh = capacity_kwh * (1.0 - soc)
+            if room_kwh <= 0.0:
+                break
+            # Solar surplus is free energy — always count it as charging.
+            surplus_kw = solar_kw - load_kw
+            if surplus_kw > 0:
+                charge_kw = min(surplus_kw, max_charge_kw, room_kwh / dt_hours)
+                soc = min(1.0, soc + charge_kw * dt_hours / capacity_kwh)
+                room_kwh = capacity_kwh * (1.0 - soc)
+            # Grid charge only when the import price beats the Happy Hour
+            # export after round-trip losses.
+            if room_kwh > 0.0 and import_price <= profitable_import + 1e-9:
+                charge_kw = min(max_charge_kw, room_kwh / dt_hours)
+                soc = min(1.0, soc + charge_kw * dt_hours / capacity_kwh)
+
+        _LOGGER.debug(
+            "Flow Power pre-window price gate: ref export=%.2fc, "
+            "profitable import cap=%.2fc, current soc=%.1f%%, "
+            "profitable-reachable soc=%.1f%%, configured target=%.1f%%",
+            ref_export * 100,
+            profitable_import * 100,
+            current_soc * 100,
+            soc * 100,
+            target_soc * 100,
+        )
+        return min(target_soc, soc)
 
     def _next_charge_by_time_target_slot(self) -> int | None:
         """Slot index of the next Charge By Time SOC target in the LP horizon."""

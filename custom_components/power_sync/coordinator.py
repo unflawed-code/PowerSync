@@ -4720,7 +4720,12 @@ class AlphaESSEnergyCoordinator(DataUpdateCoordinator):
                     raise UpdateFailed("AlphaESS cloud returned no battery data")
             except Exception as cloud_err:
                 if self.data:
-                    return self.data
+                    _LOGGER.warning(
+                        "AlphaESS cloud telemetry failed — keeping previous readings"
+                    )
+                    stale_data = dict(self.data)
+                    stale_data["telemetry_ready"] = False
+                    return stale_data
                 raise UpdateFailed(
                     f"AlphaESS cloud telemetry failed: {cloud_err}"
                 ) from cloud_err
@@ -4753,14 +4758,25 @@ class AlphaESSEnergyCoordinator(DataUpdateCoordinator):
                     except Exception as cloud_err:
                         _LOGGER.error("AlphaESS cloud fallback also failed: %s", cloud_err)
                         if self.data:
-                            return self.data
+                            _LOGGER.warning(
+                                "AlphaESS Modbus and cloud both failed — keeping previous readings"
+                            )
+                            stale_data = dict(self.data)
+                            stale_data["telemetry_ready"] = False
+                            return stale_data
                         raise UpdateFailed(
                             f"AlphaESS Modbus and cloud both failed: "
                             f"modbus={modbus_err}; cloud={cloud_err}"
                         ) from modbus_err
                 else:
                     if self.data:
-                        return self.data
+                        _LOGGER.warning(
+                            "AlphaESS Modbus read failed (%d consecutive) — keeping previous readings",
+                            self._modbus_failures,
+                        )
+                        stale_data = dict(self.data)
+                        stale_data["telemetry_ready"] = False
+                        return stale_data
                     raise UpdateFailed(
                         f"AlphaESS Modbus failed: {modbus_err}"
                     ) from modbus_err
@@ -4783,6 +4799,7 @@ class AlphaESSEnergyCoordinator(DataUpdateCoordinator):
         max_discharge_w = attrs.get("battery_max_discharge_power_w")
 
         energy_data = {
+            "telemetry_ready": True,
             "solar_power": solar_kw,
             "grid_power": grid_kw,
             "battery_power": battery_kw,

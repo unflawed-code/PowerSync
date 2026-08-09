@@ -1158,6 +1158,11 @@ CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE = "flow_power_happy_hour_tier2_rate"
 DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH = 15.0
 DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C = 10.0
 
+# When enabled, the optimizer exports continuously across the whole Happy Hour
+# window (no intra-window optimization or fragmented export runs), stopping
+# once the battery reaches the configured reserve floor.
+CONF_FLOW_POWER_STRICT_EXPORT_WINDOW = "flow_power_strict_export_window"
+
 
 def resolve_flow_power_happy_hour_end(value: object | None) -> str:
     """Return a supported Flow Power Happy Hour end time.
