@@ -33,7 +33,7 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-GITHUB_REPO = "bolagnaise/PowerSync"
+GITHUB_REPO = "unflawed-code/PowerSync"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 SCAN_INTERVAL = timedelta(hours=1)
 

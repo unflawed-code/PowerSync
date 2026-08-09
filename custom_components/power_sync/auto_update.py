@@ -48,7 +48,7 @@ POWER_SYNC_UPDATE_HINTS = (
     "tesla_amber_sync",
     "tesla amber sync",
 )
-POWER_SYNC_HACS_REPOSITORY = "bolagnaise/powersync"
+POWER_SYNC_HACS_REPOSITORY = "unflawed-code/powersync"
 AUTO_UPDATE_ACTION_INSTALLED = "installed"
 AUTO_UPDATE_ACTION_PENDING_RESTART = "pending_restart"
 
