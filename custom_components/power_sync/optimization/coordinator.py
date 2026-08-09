@@ -5656,6 +5656,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     reference_reserve_floor,
                     solar_forecast,
                     load_forecast,
+                    live_soc=soc,
                 )
             result = self._optimizer.reconcile_result_with_schedule(
                 result,
@@ -5751,6 +5752,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         applied_reserve_floor,
                         solar_forecast,
                         load_forecast,
+                        live_soc=soc,
                     )
                 result = self._optimizer.reconcile_result_with_schedule(
                     result,
@@ -10232,6 +10234,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         reserve_floor: float,
         solar_forecast: list[float],
         load_forecast: list[float],
+        live_soc: float | None = None,
     ) -> OptimizationSchedule:
         """Override the Happy Hour window with continuous export-to-reserve.
 
@@ -10335,6 +10338,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if soc is None:
                 soc = 0.0
             soc = max(0.0, min(1.0, soc))
+            if start == 0 and live_soc is not None:
+                soc = max(0.0, min(1.0, float(live_soc)))
 
             for pos in range(start, end):
                 original = actions[pos]

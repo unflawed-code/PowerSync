@@ -617,6 +617,72 @@ def test_flow_power_strict_export_holds_when_below_reserve(opt_module):
         assert action.soc == pytest.approx(0.2, abs=1e-9)
 
 
+def test_flow_power_strict_export_uses_live_soc_below_reserve(opt_module):
+    """A stale optimistic projection must not export below the live reserve.
+
+    Regression: solving mid-window with the schedule stamped above the reserve
+    while the live battery is already below it created an export for slots that
+    should hold.  The in-progress block must walk from the live SOC.
+    """
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=6, soc0=0.6)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [True] * 6,
+        reserve_floor=0.33,
+        solar_forecast=[0.0] * 6,
+        load_forecast=[0.0] * 6,
+        live_soc=0.25,
+    )
+    for action in result.actions[:6]:
+        assert action.action == "self_consumption", action.action
+        assert action.power_w == 0.0
+        assert action.battery_discharge_w == 0.0
+        assert action.soc == pytest.approx(0.33, abs=1e-9)
+
+
+def test_flow_power_strict_export_uses_live_soc_when_above_reserve(opt_module):
+    """The live SOC seeds the in-progress block instead of the projection."""
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=4, soc0=0.9)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [True] * 4,
+        reserve_floor=0.2,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0] * 4,
+        live_soc=0.6,
+    )
+    assert result.actions[0].action == "export"
+    assert result.actions[0].soc == pytest.approx(0.3222, abs=1e-3)
+    assert result.actions[1].action == "export"
+    assert result.actions[1].soc == pytest.approx(0.0444, abs=1e-3)
+    for pos in range(2, 4):
+        assert result.actions[pos].action == "self_consumption", pos
+        assert result.actions[pos].soc == pytest.approx(0.2, abs=1e-9)
+
+
+def test_flow_power_strict_export_ignores_live_soc_for_future_window(opt_module):
+    """Only the in-progress block (start == 0) is seeded by the live SOC."""
+    coordinator = _strict_coordinator(opt_module)
+    schedule = _strict_schedule(opt_module, n=6, soc0=0.9)
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        [False, False, True, True, True, True],
+        reserve_floor=0.33,
+        solar_forecast=[0.0] * 6,
+        load_forecast=[0.0] * 6,
+        live_soc=0.25,
+    )
+    assert result.actions[0].action == "idle"
+    assert result.actions[1].action == "idle"
+    assert result.actions[2].action == "export"
+    assert result.actions[2].soc == pytest.approx(0.2222, abs=1e-3)
+    for pos in range(3, 6):
+        assert result.actions[pos].action == "self_consumption", pos
+        assert result.actions[pos].soc == pytest.approx(0.33, abs=1e-9)
+
+
 def test_flow_power_strict_export_no_window_is_noop(opt_module):
     coordinator = _strict_coordinator(opt_module)
     schedule = _strict_schedule(opt_module, n=4, soc0=0.9)
@@ -768,3 +834,42 @@ def test_flow_power_export_refresh_fired_clears_timer(opt_module):
     coordinator._flow_power_export_refresh_fired()
     assert coordinator._fp_export_refresh_timer is None
     assert coordinator._fp_export_refresh_at is None
+
+def test_repro_export_below_reserve_mid_window(opt_module):
+    """Repro: battery at 25% (below 33% reserve) mid-window — should hold."""
+    coordinator = _strict_coordinator(
+        opt_module, flow_power_strict_export_window=True
+    )
+    coordinator._config.battery_capacity_wh = 13500
+    coordinator._config.max_discharge_w = 5000
+    coordinator._config.max_grid_export_w = None
+    coordinator._optimizer = SimpleNamespace(efficiency=0.9)
+
+    ScheduleAction = opt_module.ScheduleAction
+    OptimizationSchedule = opt_module.OptimizationSchedule
+    start = datetime(2026, 5, 3, 21, 10, tzinfo=timezone.utc)
+    n = 4
+    actions = []
+    for pos in range(n):
+        action = ScheduleAction()
+        action.timestamp = start + timedelta(minutes=10 * pos)
+        action.action = "idle"
+        action.power_w = 0.0
+        action.soc = 0.25
+        action.battery_charge_w = 0.0
+        action.battery_discharge_w = 0.0
+        actions.append(action)
+    schedule = OptimizationSchedule()
+    schedule.actions = actions
+
+    window = [True, True, False, False]  # 21:10 and 21:20 in window
+    result = coordinator._apply_flow_power_strict_export(
+        schedule,
+        window,
+        reserve_floor=0.33,
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+    )
+    for pos in range(2):
+        assert result.actions[pos].action == "self_consumption", pos
+        assert result.actions[pos].power_w == 0.0
