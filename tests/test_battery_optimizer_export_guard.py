@@ -3734,3 +3734,136 @@ def test_flow_power_sunny_day_grid_charges_only_shortfall_in_cheap_slots(
     assert result.schedule.actions[8].soc >= 0.995
     # The solar-only fill is not exported before the window opens.
     assert max(action.battery_discharge_w for action in result.schedule.actions[:9]) <= 1e-6
+
+
+def _tier_optimizer(module, tier1, tier2, tier1_kwh):
+    optimizer = module.BatteryOptimizer(
+        capacity_wh=13500,
+        max_charge_w=5000,
+        max_discharge_w=5000,
+        efficiency=1.0,
+        backup_reserve=0.05,
+        interval_minutes=60,
+        horizon_hours=6,
+        terminal_weight=0.0,
+    )
+    optimizer.flow_power_tier1_rate = tier1
+    optimizer.flow_power_tier2_rate = tier2
+    optimizer.flow_power_tier1_kwh = tier1_kwh
+    return optimizer
+
+
+def test_flow_power_tiered_export_matches_flat_rate_when_tier1_holds_all(
+    battery_optimizer_module,
+):
+    """Tiered export credit equals a flat rate when the tier-1 cap covers the plan.
+
+    A 13.5 kWh battery with tier1_kwh=15 values every window kWh at tier1_rate,
+    so the LP economics must be identical to a flat export price at that rate.
+    This guards the tier/window coupling row: before the sign fix the LP could
+    mint unlimited tier2 revenue and stopped exporting altogether.
+    """
+    if not battery_optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    n = 6
+    import_prices = [0.10] * 4 + [0.30] * 2
+    export_prices = [0.0] * 4 + [0.40] * 2
+    allow_export = [False] * 4 + [True] * 2
+    kwargs = dict(
+        import_prices=import_prices,
+        export_prices=export_prices,
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.0,
+        allow_battery_export=allow_export,
+        allow_grid_charge=True,
+    )
+
+    flat = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=13500,
+        max_charge_w=5000,
+        max_discharge_w=5000,
+        efficiency=1.0,
+        backup_reserve=0.05,
+        interval_minutes=60,
+        horizon_hours=6,
+        terminal_weight=0.0,
+    )
+    flat_result = flat.optimize(**kwargs)
+
+    tier = _tier_optimizer(battery_optimizer_module, 0.40, 0.10, 15.0)
+    tier_result = tier.optimize(**kwargs)
+
+    assert flat_result.feasible is True
+    assert tier_result.feasible is True
+
+    # The tier economics (first 15 kWh at 0.40) must reproduce the flat 0.40
+    # plan: same export pattern and same objective value.
+    assert tier_result.grid_export_w == pytest.approx(flat_result.grid_export_w, abs=1e-4)
+    assert tier_result.objective_value == pytest.approx(flat_result.objective_value, abs=1e-3)
+    # And the window export actually happens (the coupling-row regression).
+    assert sum(tier_result.grid_export_w) / 1000 > 5.0
+
+
+def test_flow_power_tier1_cap_limits_profitable_export(battery_optimizer_module):
+    """When tier2 is unprofitable, export stops at the tier-1 kWh cap.
+
+    With tier1_kwh=2 at 0.40 and tier2 at 0.01 (below the 0.10 grid import),
+    the LP must export exactly ~2 kWh: every kWh earns 0.40 in tier1, but any
+    kWh beyond the cap earns only 0.01 < 0.10 import cost, so exporting past
+    the cap would lose money.
+    """
+    if not battery_optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    n = 6
+    optimizer = _tier_optimizer(battery_optimizer_module, 0.40, 0.01, 2.0)
+    result = optimizer.optimize(
+        import_prices=[0.10] * 4 + [0.30] * 2,
+        export_prices=[0.0] * 4 + [0.50] * 2,
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.0,
+        allow_battery_export=[False] * 4 + [True] * 2,
+        allow_grid_charge=True,
+    )
+
+    assert result.feasible is True
+    export_kwh = sum(result.grid_export_w) / 1000
+    import_kwh = sum(result.grid_import_w) / 1000
+    # Only the tier-1 volume is worth grid-sourcing at 0.10.  The battery also
+    # fills the 5% reserve floor (0.675 kWh), so import = 2.0 + 0.675.
+    assert export_kwh == pytest.approx(2.0, abs=0.1)
+    assert import_kwh == pytest.approx(2.675, abs=0.1)
+
+
+def test_flow_power_tier_inactive_when_tier2_not_below_tier1(
+    battery_optimizer_module,
+):
+    """Equal/ascending tier rates disable the tier model (flat export applies).
+
+    tier_active requires tier2_rate < tier1_rate.  With tier1 == tier2 the
+    model must fall back to the flat window export price (0.50), so the LP
+    exports the full battery instead of stopping at the tier-1 cap.
+    """
+    if not battery_optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    n = 6
+    optimizer = _tier_optimizer(battery_optimizer_module, 0.40, 0.40, 2.0)
+    result = optimizer.optimize(
+        import_prices=[0.10] * 4 + [0.30] * 2,
+        export_prices=[0.0] * 4 + [0.50] * 2,
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.0] * n,
+        current_soc=0.0,
+        allow_battery_export=[False] * 4 + [True] * 2,
+        allow_grid_charge=True,
+    )
+
+    assert result.feasible is True
+    export_kwh = sum(result.grid_export_w) / 1000
+    # 5 kW discharge cap across the 2-slot window minus the 5% reserve floor:
+    # ~9.3 kWh exported at the flat 0.50 rate — far above the 2 kWh tier cap.
+    assert export_kwh > 8.0

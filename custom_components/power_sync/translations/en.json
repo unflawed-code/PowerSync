@@ -1926,6 +1926,8 @@
           "flow_power_base_rate": "Base rate",
           "flow_power_export_rate": "Happy Hour export rate",
           "flow_power_happy_hour_end": "Happy Hour plan end time",
+          "flow_power_happy_hour_tier1_kwh": "Happy Hour tier-1 threshold (kWh)",
+          "flow_power_happy_hour_tier2_rate": "Happy Hour tier-2 rate",
           "pea_enabled": "Enable PEA pricing (recommended)",
           "auto_sync_enabled": "Enable automatic TOU sync",
           "update_flow_power_api_key": "Enter or replace Flow Power API key"
@@ -1934,6 +1936,8 @@
           "flow_power_price_source": "Flow Power API uses your KWatch API key. AEMO Direct fetches wholesale prices from NEMWeb without an API key. Amber API uses your Amber Electric account.",
           "flow_power_export_rate": "Fixed export credit paid during Flow Power Happy Hour. Set this if Flow Power has applied a promo or account-specific feed-in rate.",
           "flow_power_happy_hour_end": "Select the Happy Hour end time stated on your Flow Power plan or fact sheet. This changes the Happy Hour window only; the separate Happy Hour export-rate setting remains unchanged.",
+          "flow_power_happy_hour_tier1_kwh": "Exports inside Happy Hour earn the tier-1 rate up to this many kWh, then the tier-2 rate for the remainder of the window.",
+          "flow_power_happy_hour_tier2_rate": "Export credit paid per kWh inside Happy Hour after the tier-1 threshold is reached.",
           "pea_enabled": "PEA reflects how Flow Power actually bills you: final rate moves with wholesale prices. Disable for flat network tariff rates.",
           "auto_sync_enabled": "Automatically upload TOU tariff schedules to your battery based on current prices.",
           "update_flow_power_api_key": "Opens a secure API-key entry page. Leave disabled to keep the currently stored key unchanged."

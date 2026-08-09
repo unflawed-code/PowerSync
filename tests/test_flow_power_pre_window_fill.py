@@ -215,7 +215,7 @@ def _coordinator(opt_module, provider: str = "flow_power", **options):
 def test_flow_power_happy_hour_rate_from_state(opt_module):
     """Rate falls back to the regional FLOW_POWER_EXPORT_RATES lookup."""
     coordinator = _coordinator(opt_module, provider="flow_power", flow_power_state="NSW1")
-    assert coordinator._flow_power_happy_hour_rate() == 0.45
+    assert coordinator._flow_power_happy_hour_rate() == 0.35
 
 
 def test_flow_power_happy_hour_rate_from_configured_cents(opt_module):

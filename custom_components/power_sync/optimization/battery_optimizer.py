@@ -347,6 +347,15 @@ class BatteryOptimizer:
         self.pre_window_solar_error_margin_kwh: float | None = None
         self.pre_window_solar_learning_confidence: float = 0.0
 
+        # Flow Power tiered Happy Hour export credit. When set, grid export
+        # inside the Happy Hour window is valued at `flow_power_tier1_rate`
+        # ($/kWh) for the first `flow_power_tier1_kwh` kWh and at
+        # `flow_power_tier2_rate` ($/kWh) thereafter.  `None` disables the
+        # tier and falls back to the flat per-period export price.
+        self.flow_power_tier1_rate: float | None = None
+        self.flow_power_tier2_rate: float | None = None
+        self.flow_power_tier1_kwh: float = 15.0
+
         # Terminal valuation units. The original LP wrote terminal coefficients
         # as `terminal_price * eff * dt / cap`, which is dimensionally wrong:
         # `terminal_price` is $/kWh, so the correct per-kW objective coefficient
@@ -2502,7 +2511,37 @@ class BatteryOptimizer:
         if cost_neutral_active:
             next_offset += p_n
         energy_offset = next_offset
-        num_vars = energy_offset + p_n + 1
+
+        # Flow Power tiered Happy Hour export credit. The tiered rate applies
+        # to grid export inside the window (the periods with a positive export
+        # price, which `_apply_flow_power_export` restricts to the window).
+        tier1_rate = self.flow_power_tier1_rate
+        tier2_rate = self.flow_power_tier2_rate
+        tier1_kwh = self.flow_power_tier1_kwh
+        tier_window = [
+            idx
+            for idx, price in enumerate(p_export)
+            if price > 0.001
+        ]
+        tier_active = bool(
+            tier_window
+            and tier1_rate is not None
+            and tier2_rate is not None
+            and tier1_rate >= 0.0
+            and tier2_rate >= 0.0
+            and tier2_rate < tier1_rate
+            and (tier1_kwh or 0.0) > 1e-6
+        )
+        tier_window_set = set(tier_window) if tier_active else set()
+
+        hh_tier1_offset = None
+        hh_tier2_offset = None
+        if tier_active:
+            hh_tier1_offset = energy_offset + p_n + 1
+            hh_tier2_offset = hh_tier1_offset + 1
+            num_vars = hh_tier2_offset + 1
+        else:
+            num_vars = energy_offset + p_n + 1
 
         def grid_import_var(t: int) -> int:
             return t
@@ -2539,6 +2578,12 @@ class BatteryOptimizer:
 
         def battery_to_grid_var(t: int) -> int:
             return battery_to_grid_offset + t
+
+        def hh_tier1_var() -> int:
+            return hh_tier1_offset
+
+        def hh_tier2_var() -> int:
+            return hh_tier2_offset
 
         # === Objective function: cost minimization ===
         # minimize SUM(import_price * grid_import - export_price * grid_export) * dt
@@ -2591,9 +2636,17 @@ class BatteryOptimizer:
             c[charge_var(t)] += 1e-5 * p_dt[t]
             c[discharge_var(t)] += 1e-5 * p_dt[t]
             if p_export[t] > 0:
-                c[grid_export_var(t)] = -(
-                    p_export[t] + eps * (p_n - t)
-                ) * p_dt[t]  # grid_export: prefer earlier
+                if tier_active and t in tier_window_set:
+                    # Tiered Happy Hour export credit: value window export
+                    # through the cumulative tier variables below instead of a
+                    # flat per-kWh rate.  Keep only a negligible tie-breaker so
+                    # earlier exports are preferred without distorting the tier
+                    # economics (first `tier1_kwh` at tier1_rate, rest tier2).
+                    c[grid_export_var(t)] = -eps * (p_n - t) * p_dt[t]
+                else:
+                    c[grid_export_var(t)] = -(
+                        p_export[t] + eps * (p_n - t)
+                    ) * p_dt[t]  # grid_export: prefer earlier
             elif bonus_export_active and p_export_bonus[t] > 0:
                 # ZeroHero-style capped bonuses make otherwise-zero exports
                 # valuable only through the linked bonus variable below.
@@ -2777,9 +2830,19 @@ class BatteryOptimizer:
             if eligible_recharge:
                 paired_priority_recharge_periods[t] = eligible_recharge
 
+        if tier_active:
+            # Revenue for the tiered Happy Hour export credit.  The coupling
+            # row below bounds tier1+tier2 by the total window export, and
+            # because tier1_rate > tier2_rate the LP fills tier1 first.
+            c[hh_tier1_var()] = -(tier1_rate)
+            c[hh_tier2_var()] = -(tier2_rate)
+
         pre_window_boundary: int | None = None
         pre_window_effective_target: float | None = None
         A_ub_rows = 2 * p_n
+        if tier_active:
+            # One row coupling total window export to the tier variables.
+            A_ub_rows += 1
         if bonus_export_active:
             export_bonus_cap_rows = (
                 len(export_group_caps) if grouped_export_bonus else 1
@@ -3134,6 +3197,20 @@ class BatteryOptimizer:
                 # request has no positive effective deadline target.
                 b_ub.append(0.0)
 
+        if tier_active:
+            # Couple the tier variables to the total energy exported inside
+            # the Happy Hour window: tier1 + tier2 <= sum(window export kWh).
+            # With tier1_rate > tier2_rate and both revenue coefficients
+            # negative (minimization objective), the LP drives tier1+tier2 up
+            # to the equality boundary (never above it, since it cannot exceed
+            # the window export).  Row is `tier1 + tier2 - sum(p_dt*export)`
+            # <= 0, i.e. A_ub coefficients +1/+1/-p_dt.
+            for t in tier_window:
+                A_ub[len(b_ub), grid_export_var(t)] = -p_dt[t]
+            A_ub[len(b_ub), hh_tier1_var()] = 1.0
+            A_ub[len(b_ub), hh_tier2_var()] = 1.0
+            b_ub.append(0.0)
+
         solar_prefill_ceilings = self._pre_window_solar_prefill_ceilings(
             pre_window_boundary=pre_window_boundary,
             target_soc=pre_window_effective_target,
@@ -3362,6 +3439,13 @@ class BatteryOptimizer:
             upper = cap if upper_soc is None else upper_soc * cap
             lower = reserve_floor[t] * cap
             bounds.append((lower, max(lower, upper)))
+
+        if tier_active:
+            # Tier variables (kWh): tier1 is capped at the plan's tier-1
+            # threshold; tier2 is only bounded by the window-export coupling
+            # row above (generous absolute cap as a numerical safety net).
+            bounds.append((0.0, tier1_kwh))
+            bounds.append((0.0, 1e6))
 
         A_eq = A_eq.tocsr()
         A_ub = A_ub.tocsr()

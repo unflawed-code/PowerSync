@@ -10550,7 +10550,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             CONF_ELECTRICITY_PROVIDER,
             CONF_FLOW_POWER_EXPORT_RATE,
             CONF_FLOW_POWER_HAPPY_HOUR_END,
+            CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+            CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
             CONF_FLOW_POWER_STATE,
+            DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+            DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C,
             FLOW_POWER_EXPORT_RATES,
             resolve_flow_power_happy_hour_end,
         )
@@ -10598,6 +10602,40 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             slot = now + timedelta(minutes=i * interval)
             mins = slot.hour * 60 + slot.minute
             result.append(happy_rate if happy_start <= mins < happy_end else 0.0)
+
+        # Wire the tiered Happy Hour credit into the LP.  The tier-1 rate is
+        # the per-account rate resolved above (regional default or configured
+        # `flow_power_export_rate`); the tier-2 rate and tier-1 kWh threshold
+        # are separate options so the second tier tracks the plan, not the
+        # account-specific first-tier credit.
+        try:
+            tier1_kwh = float(
+                self._entry.options.get(
+                    CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                    self._entry.data.get(
+                        CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                        DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                    ),
+                )
+            )
+        except (ValueError, TypeError):
+            tier1_kwh = DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH
+        try:
+            tier2_rate_c = float(
+                self._entry.options.get(
+                    CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+                    self._entry.data.get(
+                        CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+                        DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C,
+                    ),
+                )
+            )
+        except (ValueError, TypeError):
+            tier2_rate_c = DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C
+        if self._optimizer is not None:
+            self._optimizer.flow_power_tier1_rate = float(happy_rate)
+            self._optimizer.flow_power_tier2_rate = max(0.0, tier2_rate_c) / 100.0
+            self._optimizer.flow_power_tier1_kwh = max(0.0, tier1_kwh)
 
         return result
 

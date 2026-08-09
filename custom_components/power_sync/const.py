@@ -1127,9 +1127,12 @@ ALL_NETWORK_TARIFFS = get_all_tariff_options()
 
 # Flow Power Happy Hour export rates ($/kWh)
 FLOW_POWER_EXPORT_RATES = {
-    "NSW1": 0.45,   # 45c/kWh
-    "QLD1": 0.45,   # 45c/kWh
-    "SA1": 0.45,    # 45c/kWh
+    # First tier of the tiered Happy Hour plan (default 35c). Flow Power
+    # publishes a per-account credit that can differ (e.g. a 5c Solar Choice
+    # bonus), so the configured `flow_power_export_rate` override wins.
+    "NSW1": 0.35,   # 35c/kWh
+    "QLD1": 0.35,   # 35c/kWh
+    "SA1": 0.35,    # 35c/kWh
     "VIC1": 0.35,   # 35c/kWh
     "TAS1": 0.00,   # No Happy Hour in Tasmania
 }
@@ -1145,6 +1148,15 @@ FLOW_POWER_HAPPY_HOUR_END_OPTIONS = {
     "19:30": "5:30pm to 7:30pm (2 hours)",
     "21:30": "5:30pm to 9:30pm (4 hours)",
 }
+
+# Flow Power tiered Happy Hour export credit. The first TIER1_KWH exported
+# inside the window is paid the tier-1 rate (the regional default or the
+# configured `flow_power_export_rate`), and export beyond that is paid the
+# tier-2 rate.  Defaults track the current published plan (35c then 10c).
+CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH = "flow_power_happy_hour_tier1_kwh"
+CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE = "flow_power_happy_hour_tier2_rate"
+DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH = 15.0
+DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C = 10.0
 
 
 def resolve_flow_power_happy_hour_end(value: object | None) -> str:

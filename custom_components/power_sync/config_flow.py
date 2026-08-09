@@ -313,10 +313,14 @@ from .const import (
     CONF_FLOW_POWER_BASE_RATE,
     CONF_FLOW_POWER_EXPORT_RATE,
     CONF_FLOW_POWER_HAPPY_HOUR_END,
+    CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+    CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
     CONF_PEA_CUSTOM_VALUE,
     FLOW_POWER_DEFAULT_BASE_RATE,
     FLOW_POWER_EXPORT_RATES,
     DEFAULT_FLOW_POWER_HAPPY_HOUR_END,
+    DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+    DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C,
     FLOW_POWER_HAPPY_HOUR_END_OPTIONS,
     resolve_flow_power_happy_hour_end,
     # Export price boost configuration
@@ -2448,6 +2452,30 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                                 for value, label in FLOW_POWER_HAPPY_HOUR_END_OPTIONS.items()
                             ],
                             mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                        default=DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0.0,
+                            max=500.0,
+                            step=1.0,
+                            unit_of_measurement="kWh",
+                            mode=NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+                        default=DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=0.0,
+                            max=100.0,
+                            step=0.01,
+                            unit_of_measurement=self._selector_unit(),
+                            mode=NumberSelectorMode.BOX,
                         )
                     ),
                     vol.Optional(CONF_FLOWPOWER_API_KEY): TextSelector(
@@ -14395,6 +14423,26 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     for value, label in FLOW_POWER_HAPPY_HOUR_END_OPTIONS.items()
                 ],
                 mode=SelectSelectorMode.DROPDOWN,
+            )),
+            vol.Required(
+                CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                default=self._get_option(
+                    CONF_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                    DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER1_KWH,
+                ),
+            ): NumberSelector(NumberSelectorConfig(
+                min=0.0, max=500.0, step=1.0, unit_of_measurement="kWh",
+                mode=NumberSelectorMode.BOX,
+            )),
+            vol.Required(
+                CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+                default=self._get_option(
+                    CONF_FLOW_POWER_HAPPY_HOUR_TIER2_RATE,
+                    DEFAULT_FLOW_POWER_HAPPY_HOUR_TIER2_RATE_C,
+                ),
+            ): NumberSelector(NumberSelectorConfig(
+                min=0.0, max=100.0, step=0.01, unit_of_measurement=self._selector_unit(),
+                mode=NumberSelectorMode.BOX,
             )),
             vol.Optional(
                 CONF_PEA_ENABLED,
